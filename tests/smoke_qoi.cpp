@@ -133,7 +133,7 @@ int wmain(int argc, wchar_t** argv)
 	ini.replace(ini.rfind(L'.'), std::wstring::npos, L".ini");
 	DeleteFileW(ini.c_str());
 	if (CheckRender(qoiPath, 0xE0) != 0) return 1;
-	const char kIni[] = "[render]\r\nbackground_color=000000\r\n";
+	const char kIni[] = "[render]\nbackground_color=000000\n";  // LF: the profile API must not need CRLF
 	CHECK(WriteFileBytes(ini, kIni, sizeof(kIni) - 1));
 	int rc = CheckRender(qoiPath, 0x00);
 	DeleteFileW(ini.c_str());
