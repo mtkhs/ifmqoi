@@ -22,40 +22,6 @@
 background_color=FFFFFF
 ```
 
-## ビルド方法
-
-### 必要な環境
-
-- Visual Studio 2022 以降
-- CMake 3.15 以降
-- Windows 10/11 (64bit)
-
-### ビルド手順
-
-1. リポジトリを取得
-```bash
-git clone <このリポジトリのURL>
-cd ifmqoi
-```
-
-2. ビルドディレクトリを作成
-```bash
-mkdir build
-cd build
-```
-
-3. CMake を実行
-```bash
-cmake .. -G "Visual Studio 17 2022" -A x64
-```
-
-4. コンパイル
-```bash
-cmake --build . --config Release
-```
-
-ビルドされたプラグインは `build/Release` に出力されます
-
 ## 📚 参考資料
 
 ### 開発に使用したソフトウェア・参考にした情報
