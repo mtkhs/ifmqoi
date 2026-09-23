@@ -10,7 +10,7 @@
 
 namespace {
 
-const char* kInfoA[] = { "00IN", "QOI Plug-in Version 0.1 (C) mtkhs", "*.qoi", "Quite OK Image format (*.qoi)" };
+const char* kInfoA[] = { "00IN", "QOI Plug-in Version 0.2 (C) mtkhs", "*.qoi", "Quite OK Image format (*.qoi)" };
 constexpr int kInfoCount = 4;
 
 // The DIB has no alpha channel, so pixels are composited onto this colour.
