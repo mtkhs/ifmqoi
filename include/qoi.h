@@ -49,4 +49,10 @@ inline int qoi_color_hash(const qoi_rgba& c) {
     return c.r * 3 + c.g * 5 + c.b * 7 + c.a * 11;
 }
 
+// Parses the 14-byte header into desc. false on a bad magic or on dimensions
+// the decoder would reject, so a true result means qoi_decode can proceed.
+bool qoi_read_header(const void* data, int size, qoi_desc* desc);
+
+// Decodes to a malloc()ed buffer of width*height*channels bytes (channels 0
+// keeps the file's own count). nullptr on any error.
 void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels);

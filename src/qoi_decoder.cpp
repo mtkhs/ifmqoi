@@ -2,11 +2,9 @@
 #include <cstdlib>
 #include <cstring>
 
-void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels) {
-    if (data == nullptr || desc == nullptr ||
-        (channels != 0 && channels != 3 && channels != 4) ||
-        size < QOI_HEADER_SIZE + QOI_END_MARKER_SIZE) {
-        return nullptr;
+bool qoi_read_header(const void* data, int size, qoi_desc* desc) {
+    if (data == nullptr || desc == nullptr || size < QOI_HEADER_SIZE) {
+        return false;
     }
 
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
@@ -14,7 +12,7 @@ void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels) {
 
     uint32_t magic = qoi_read_32(bytes, &p);
     if (magic != QOI_MAGIC) {
-        return nullptr;
+        return false;
     }
 
     desc->width = qoi_read_32(bytes, &p);
@@ -22,12 +20,21 @@ void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels) {
     desc->channels = bytes[p++];
     desc->colorspace = bytes[p++];
 
-    if (desc->width == 0 || desc->height == 0 ||
-        desc->channels < 3 || desc->channels > 4 ||
-        desc->colorspace > 1 ||
-        desc->height >= QOI_PIXELS_MAX / desc->width) {
+    return !(desc->width == 0 || desc->height == 0 ||
+             desc->channels < 3 || desc->channels > 4 ||
+             desc->colorspace > 1 ||
+             desc->height >= QOI_PIXELS_MAX / desc->width);
+}
+
+void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels) {
+    if ((channels != 0 && channels != 3 && channels != 4) ||
+        size < QOI_HEADER_SIZE + QOI_END_MARKER_SIZE ||
+        !qoi_read_header(data, size, desc)) {
         return nullptr;
     }
+
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    int p = QOI_HEADER_SIZE;
 
     if (channels == 0) {
         channels = desc->channels;

@@ -1,4 +1,3 @@
-LIBRARY ifmqoi
 EXPORTS
     GetPluginInfo
     GetPluginInfoW

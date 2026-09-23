@@ -1,287 +1,282 @@
+#include <windows.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
 #include "susie.h"
 #include "qoi.h"
-#include <windows.h>
-#include <vector>
-#include <fstream>
 
-static std::vector<uint8_t> read_file(LPCSTR filename)
+namespace {
+
+const char* kInfoA[] = { "00IN", "QOI Plug-in Version 0.1 (C) mtkhs", "*.qoi", "Quite OK Image format (*.qoi)" };
+constexpr int kInfoCount = 4;
+
+// The DIB has no alpha channel, so pixels are composited onto this colour.
+// Overridable per install: [render] background_color=RRGGBB in ifmqoi.ini
+// next to the plugin.
+constexpr uint32_t kDefaultBackground = 0xE0E0E0u;
+
+// Sibling INI path: same dir/basename as this DLL with .ini extension.
+bool OwnIniPath(wchar_t* out, size_t cap)
 {
-	std::ifstream file(filename, std::ios::binary | std::ios::ate);
-	if (!file) {
-		return {};
-	}
-
-	const std::streamsize size = file.tellg();
-	file.seekg(0, std::ios::beg);
-
-	std::vector<uint8_t> buffer(static_cast<size_t>(size));
-	if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-		return {};
-	}
-
-	return buffer;
-}
-
-static bool is_qoi_format(const void* data, size_t size)
-{
-	if (size < QOI_HEADER_SIZE) {
+	HMODULE self = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                        reinterpret_cast<LPCWSTR>(&OwnIniPath), &self)) {
 		return false;
 	}
-
-	const auto* bytes = static_cast<const uint8_t*>(data);
-	const uint32_t magic = (static_cast<uint32_t>(bytes[0]) << 24) |
-	                      (static_cast<uint32_t>(bytes[1]) << 16) |
-	                      (static_cast<uint32_t>(bytes[2]) << 8) |
-	                      static_cast<uint32_t>(bytes[3]);
-
-	return magic == QOI_MAGIC;
+	DWORD n = GetModuleFileNameW(self, out, static_cast<DWORD>(cap));
+	if (n == 0 || n >= cap) return false;
+	wchar_t* dot = wcsrchr(out, L'.');
+	if (!dot || static_cast<size_t>(dot - out) + 5 > cap) return false;  // need ".ini\0"
+	wcscpy(dot, L".ini");
+	return true;
 }
 
-static int SusieIsSupportedFromFile(const char*, const void* dw)
+// Cached on first call. INI changes require reloading the plugin.
+uint32_t BackgroundColor()
 {
-	if (dw == nullptr) {
-		return 0;
-	}
-	return is_qoi_format(dw, 2048) ? 1 : 0;
+	static uint32_t color = [] {
+		wchar_t ini[MAX_PATH];
+		if (!OwnIniPath(ini, MAX_PATH)) return kDefaultBackground;
+		wchar_t hex[16];
+		GetPrivateProfileStringW(L"render", L"background_color", L"", hex, 16, ini);
+		if (wcslen(hex) != 6) return kDefaultBackground;
+		wchar_t* end = nullptr;
+		unsigned long v = wcstoul(hex, &end, 16);
+		return (end && *end == L'\0') ? static_cast<uint32_t>(v & 0xFFFFFF) : kDefaultBackground;
+	}();
+	return color;
 }
 
-static int SusieGetPictureInfoFromFile(const char* buf, LONG_PTR len, unsigned int flag, SUSIE_PICTUREINFO* lpInfo)
+std::wstring AnsiToWide(const char* ansi)
 {
-	if (lpInfo == nullptr) {
-		return SUSIEERROR_INTERNAL;
-	}
+	if (!ansi) return L"";
+	int n = MultiByteToWideChar(CP_ACP, 0, ansi, -1, nullptr, 0);
+	if (n <= 1) return L"";
+	std::wstring out(static_cast<size_t>(n - 1), L'\0');
+	MultiByteToWideChar(CP_ACP, 0, ansi, -1, &out[0], n);
+	return out;
+}
 
+// IsSupported's dw is either a pointer to the first SUSIE_CHECK_SIZE bytes or
+// a Windows HANDLE (small integer) cast to void*. User-mode addresses are
+// always above 64 KB.
+const uint8_t* ToHeadPtr(const void* dw)
+{
+	return (reinterpret_cast<uintptr_t>(dw) > 0xFFFF) ? static_cast<const uint8_t*>(dw) : nullptr;
+}
+
+bool HasQoiExtension(const wchar_t* filename)
+{
+	const wchar_t* dot = wcsrchr(filename, L'.');
+	return dot && _wcsicmp(dot + 1, L"qoi") == 0;
+}
+
+bool IsQoi(const uint8_t* p, size_t n)
+{
+	int pos = 0;
+	return n >= QOI_HEADER_SIZE && qoi_read_32(p, &pos) == QOI_MAGIC;
+}
+
+std::vector<uint8_t> ReadFile(const wchar_t* path)
+{
+	std::ifstream f(path, std::ios::binary | std::ios::ate);
+	if (!f) return {};
+	const std::streamsize size = f.tellg();
+	if (size <= 0) return {};
+	std::vector<uint8_t> buf(static_cast<size_t>(size));
+	f.seekg(0);
+	if (!f.read(reinterpret_cast<char*>(buf.data()), size)) return {};
+	return buf;
+}
+
+// buf is a path (A or W per isW) for disk input, or the bytes for memory input.
+int LoadInput(const void* buf, LONG_PTR len, unsigned int flag, bool isW, std::vector<uint8_t>& data)
+{
+	switch (flag & SUSIE_SOURCE_MASK) {
+	case SUSIE_SOURCE_MEM: {
+		if (len <= 0) return SUSIEERROR_INTERNAL;
+		const auto* p = static_cast<const uint8_t*>(buf);
+		data.assign(p, p + len);
+		return SUSIEERROR_NOERROR;
+	}
+	case SUSIE_SOURCE_DISK: {
+		std::wstring path = isW ? std::wstring(static_cast<LPCWSTR>(buf)) : AnsiToWide(static_cast<LPCSTR>(buf));
+		data = ReadFile(path.c_str());
+		return data.empty() ? SUSIEERROR_FAULTREAD : SUSIEERROR_NOERROR;
+	}
+	default:
+		return SUSIEERROR_NOTSUPPORT;
+	}
+}
+
+int GetPictureInfoImpl(const void* buf, LONG_PTR len, unsigned int flag, bool isW, SUSIE_PICTUREINFO* lpInfo)
+{
 	std::vector<uint8_t> data;
-
-	if ((flag & 0x07) == SUSIE_INPUT_DISK) {
-		data = read_file(buf);
-		if (data.empty()) {
-			return SUSIEERROR_FAULTREAD;
-		}
-	} else if ((flag & 0x07) == SUSIE_INPUT_MEMORY) {
-		if (buf == nullptr || len <= 0) {
-			return SUSIEERROR_INTERNAL;
-		}
-		data.assign(reinterpret_cast<const uint8_t*>(buf),
-		           reinterpret_cast<const uint8_t*>(buf) + len);
-	} else {
-		return SUSIEERROR_INTERNAL;
-	}
-
-	if (!is_qoi_format(data.data(), data.size())) {
-		return SUSIEERROR_UNKNOWNFORMAT;
-	}
+	int rc = LoadInput(buf, len, flag, isW, data);
+	if (rc != SUSIEERROR_NOERROR) return rc;
+	if (!IsQoi(data.data(), data.size())) return SUSIEERROR_UNKNOWNFORMAT;
 
 	qoi_desc desc;
-	void* pixels = qoi_decode(data.data(), static_cast<int>(data.size()), &desc, 0);
-	if (pixels == nullptr) {
-		return SUSIEERROR_BROKENDATA;
-	}
-
-	free(pixels);
+	if (!qoi_read_header(data.data(), static_cast<int>(data.size()), &desc)) return SUSIEERROR_BROKENDATA;
 
 	lpInfo->left = 0;
 	lpInfo->top = 0;
-	lpInfo->width = desc.width;
-	lpInfo->height = desc.height;
+	lpInfo->width = static_cast<long>(desc.width);
+	lpInfo->height = static_cast<long>(desc.height);
 	lpInfo->x_density = 0;
 	lpInfo->y_density = 0;
 	lpInfo->colorDepth = desc.channels * 8;
 	lpInfo->hInfo = nullptr;
-
 	return SUSIEERROR_NOERROR;
 }
 
-static int SusieGetPictureFromFile(const char* buf, LONG_PTR len, unsigned int flag, HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS lpProgressCallback, LONG_PTR lData)
+inline uint8_t Composite(uint8_t src, uint8_t bg, uint8_t alpha)
 {
-	if (pHBInfo == nullptr || pHBm == nullptr) {
-		return SUSIEERROR_INTERNAL;
-	}
+	return static_cast<uint8_t>((src * alpha + bg * (255 - alpha) + 127) / 255);
+}
 
+int GetPictureImpl(const void* buf, LONG_PTR len, unsigned int flag, bool isW,
+                   HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS progress, LONG_PTR lData)
+{
 	*pHBInfo = nullptr;
 	*pHBm = nullptr;
 
 	std::vector<uint8_t> data;
+	int rc = LoadInput(buf, len, flag, isW, data);
+	if (rc != SUSIEERROR_NOERROR) return rc;
+	if (!IsQoi(data.data(), data.size())) return SUSIEERROR_UNKNOWNFORMAT;
 
-	if ((flag & 0x07) == SUSIE_INPUT_DISK) {
-		data = read_file(buf);
-		if (data.empty()) {
-			return SUSIEERROR_FAULTREAD;
-		}
-	} else if ((flag & 0x07) == SUSIE_INPUT_MEMORY) {
-		if (buf == nullptr || len <= 0) {
-			return SUSIEERROR_INTERNAL;
-		}
-		data.assign(reinterpret_cast<const uint8_t*>(buf),
-		           reinterpret_cast<const uint8_t*>(buf) + len);
-	} else {
-		return SUSIEERROR_INTERNAL;
-	}
-
-	if (!is_qoi_format(data.data(), data.size())) {
-		return SUSIEERROR_UNKNOWNFORMAT;
-	}
-
-	if (lpProgressCallback != nullptr) {
-		if (lpProgressCallback(0, 1, lData) != 0) {
-			return SUSIEERROR_USERCANCEL;
-		}
-	}
+	if (progress && progress(0, 1, lData) != 0) return SUSIEERROR_USERCANCEL;
 
 	qoi_desc desc;
-	void* pixels = qoi_decode(data.data(), static_cast<int>(data.size()), &desc, 4);
-	if (pixels == nullptr) {
-		return SUSIEERROR_BROKENDATA;
-	}
+	auto* pixels = static_cast<uint8_t*>(qoi_decode(data.data(), static_cast<int>(data.size()), &desc, 4));
+	if (!pixels) return SUSIEERROR_BROKENDATA;
 
-	const DWORD info_size = sizeof(BITMAPINFOHEADER);
-	*pHBInfo = LocalAlloc(LMEM_MOVEABLE, info_size);
-	if (*pHBInfo == nullptr) {
+	// 32bpp rows are 4-byte aligned by construction.
+	const size_t bitmapSize = static_cast<size_t>(desc.width) * desc.height * 4;
+	HLOCAL hInfo = LocalAlloc(LMEM_MOVEABLE | LMEM_ZEROINIT, sizeof(BITMAPINFOHEADER));
+	HLOCAL hBits = LocalAlloc(LMEM_MOVEABLE, bitmapSize);
+	auto* bmi = hInfo ? static_cast<BITMAPINFOHEADER*>(LocalLock(hInfo)) : nullptr;
+	auto* bits = hBits ? static_cast<uint8_t*>(LocalLock(hBits)) : nullptr;
+	if (!bmi || !bits) {
+		if (bmi) LocalUnlock(hInfo);
+		if (bits) LocalUnlock(hBits);
+		if (hInfo) LocalFree(hInfo);
+		if (hBits) LocalFree(hBits);
 		free(pixels);
-		return SUSIEERROR_NOMEMORY;
-	}
-
-	auto* bmi = static_cast<BITMAPINFOHEADER*>(LocalLock(*pHBInfo));
-	if (bmi == nullptr) {
-		LocalFree(*pHBInfo);
-		free(pixels);
-		return SUSIEERROR_NOMEMORY;
+		return SUSIEERROR_EMPTYMEMORY;
 	}
 
 	bmi->biSize = sizeof(BITMAPINFOHEADER);
-	bmi->biWidth = desc.width;
-	bmi->biHeight = desc.height;
+	bmi->biWidth = static_cast<LONG>(desc.width);
+	bmi->biHeight = static_cast<LONG>(desc.height);
 	bmi->biPlanes = 1;
 	bmi->biBitCount = 32;
 	bmi->biCompression = BI_RGB;
-	bmi->biSizeImage = 0;
-	bmi->biXPelsPerMeter = 0;
-	bmi->biYPelsPerMeter = 0;
-	bmi->biClrUsed = 0;
-	bmi->biClrImportant = 0;
+	bmi->biSizeImage = static_cast<DWORD>(bitmapSize);
 
-	LocalUnlock(*pHBInfo);
-
-	const DWORD bitmap_size = desc.width * desc.height * 4;
-	*pHBm = LocalAlloc(LMEM_MOVEABLE, bitmap_size);
-	if (*pHBm == nullptr) {
-		LocalFree(*pHBInfo);
-		free(pixels);
-		return SUSIEERROR_NOMEMORY;
-	}
-
-	auto* bitmap = static_cast<uint8_t*>(LocalLock(*pHBm));
-	if (bitmap == nullptr) {
-		LocalFree(*pHBInfo);
-		LocalFree(*pHBm);
-		free(pixels);
-		return SUSIEERROR_NOMEMORY;
-	}
-
-	auto* src = static_cast<uint8_t*>(pixels);
+	const uint32_t bg = BackgroundColor();
+	const uint8_t bgR = static_cast<uint8_t>(bg >> 16), bgG = static_cast<uint8_t>(bg >> 8), bgB = static_cast<uint8_t>(bg);
 	for (uint32_t y = 0; y < desc.height; y++) {
-		for (uint32_t x = 0; x < desc.width; x++) {
-			const uint32_t src_idx = ((desc.height - 1 - y) * desc.width + x) * 4;
-			const uint32_t dst_idx = (y * desc.width + x) * 4;
-
-			const float alpha = src[src_idx + 3] / 255.0f;
-			const float inv_alpha = 1.0f - alpha;
-			constexpr float bg_color = 224.0f;
-
-			bitmap[dst_idx + 0] = static_cast<uint8_t>(src[src_idx + 2] * alpha + bg_color * inv_alpha);
-			bitmap[dst_idx + 1] = static_cast<uint8_t>(src[src_idx + 1] * alpha + bg_color * inv_alpha);
-			bitmap[dst_idx + 2] = static_cast<uint8_t>(src[src_idx + 0] * alpha + bg_color * inv_alpha);
-			bitmap[dst_idx + 3] = 255;
+		const uint8_t* src = pixels + static_cast<size_t>(y) * desc.width * 4;
+		uint8_t* dst = bits + static_cast<size_t>(desc.height - 1 - y) * desc.width * 4;  // bottom-up
+		for (uint32_t x = 0; x < desc.width; x++, src += 4, dst += 4) {
+			const uint8_t a = src[3];
+			dst[0] = Composite(src[2], bgB, a);
+			dst[1] = Composite(src[1], bgG, a);
+			dst[2] = Composite(src[0], bgR, a);
+			dst[3] = 255;
 		}
 	}
 
-	LocalUnlock(*pHBm);
+	LocalUnlock(hInfo);
+	LocalUnlock(hBits);
 	free(pixels);
 
-	if (lpProgressCallback != nullptr) {
-		lpProgressCallback(1, 1, lData);
-	}
+	if (progress) progress(1, 1, lData);
 
+	*pHBInfo = hInfo;
+	*pHBm = hBits;
 	return SUSIEERROR_NOERROR;
 }
 
-extern "C" int __stdcall GetPluginInfo(int infono, LPSTR buf, int buflen)
+}  // namespace
+
+extern "C" {
+
+int __stdcall GetPluginInfo(int infono, LPSTR buf, int buflen)
 {
-	if ( infono && (buflen < 64) ) infono = -1;
-	switch (infono){
-		case 0:
-			lstrcpyA(buf, "00IN");
-			break;
-		case 1:
-			lstrcpyA(buf, "QOI Plug-in Version 0.1 (C) mtkhs");
-			break;
-		case 2:
-			lstrcpyA(buf, "*.qoi");
-			break;
-		case 3:
-			lstrcpyA(buf, "Quite OK Image format (*.qoi)");
-			break;
-		default:
-			buf[0] = '\0';
-			break;
-	}
-	return static_cast<int>(lstrlenA(buf));
+	if (!buf || buflen <= 0) return 0;
+	if (infono < 0 || infono >= kInfoCount) { buf[0] = '\0'; return 0; }
+	int n = static_cast<int>(strlen(kInfoA[infono]));
+	if (n >= buflen) n = buflen - 1;
+	memcpy(buf, kInfoA[infono], n);
+	buf[n] = '\0';
+	return n;
 }
 
-extern "C" int __stdcall GetPluginInfoW(int infono, LPWSTR buf, int buflen)
+int __stdcall GetPluginInfoW(int infono, LPWSTR buf, int buflen)
 {
-	char bufA[1024];
-
-	if ( infono && (buflen < 64) ){
-		buf[0] = L'\0';
-		return 0;
-	}
-	GetPluginInfo(infono, bufA, 1024);
-	MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, bufA, -1, buf, buflen);
+	if (!buf || buflen <= 0) return 0;
+	char bufA[256];
+	int n = GetPluginInfo(infono, bufA, sizeof(bufA));
+	if (n == 0) { buf[0] = L'\0'; return 0; }
+	MultiByteToWideChar(CP_ACP, 0, bufA, -1, buf, buflen);
 	buf[buflen - 1] = L'\0';
-	return static_cast<int>(lstrlenW(buf));
+	return static_cast<int>(wcslen(buf));
 }
 
-extern "C" int __stdcall IsSupported(LPCSTR filename, const void* dw)
+int __stdcall IsSupported(LPCSTR filename, const void* dw)
 {
-	return SusieIsSupportedFromFile(filename, dw);
+	try {
+		if (!filename) return 0;
+		const uint8_t* head = ToHeadPtr(dw);
+		if (head) return IsQoi(head, SUSIE_CHECK_SIZE) ? 1 : 0;
+		return HasQoiExtension(AnsiToWide(filename).c_str()) ? 1 : 0;
+	} catch (...) { return 0; }
 }
 
-extern "C" int __stdcall IsSupportedW(LPCWSTR filename, const void* dw)
+int __stdcall IsSupportedW(LPCWSTR filename, const void* dw)
 {
-	char filenameA[MAX_PATH];
-	WideCharToMultiByte(CP_ACP, 0, filename, -1, filenameA, MAX_PATH, nullptr, nullptr);
-	return SusieIsSupportedFromFile(filenameA, dw);
+	if (!filename) return 0;
+	const uint8_t* head = ToHeadPtr(dw);
+	if (head) return IsQoi(head, SUSIE_CHECK_SIZE) ? 1 : 0;
+	return HasQoiExtension(filename) ? 1 : 0;
 }
 
-extern "C" int __stdcall GetPictureInfo(LPCSTR buf, LONG_PTR len, unsigned int flag, SUSIE_PICTUREINFO* lpInfo)
+int __stdcall GetPictureInfo(LPCSTR buf, LONG_PTR len, unsigned int flag, SUSIE_PICTUREINFO* lpInfo)
 {
-	return SusieGetPictureInfoFromFile(buf, len, flag, lpInfo);
+	try {
+		if (!buf || !lpInfo) return SUSIEERROR_INTERNAL;
+		return GetPictureInfoImpl(buf, len, flag, false, lpInfo);
+	} catch (...) { return SUSIEERROR_INTERNAL; }
 }
 
-extern "C" int __stdcall GetPictureInfoW(LPCWSTR buf, LONG_PTR len, unsigned int flag, SUSIE_PICTUREINFO* lpInfo)
+int __stdcall GetPictureInfoW(LPCWSTR buf, LONG_PTR len, unsigned int flag, SUSIE_PICTUREINFO* lpInfo)
 {
-	if ((flag & 0x07) == SUSIE_INPUT_DISK) {
-		char bufA[MAX_PATH];
-		WideCharToMultiByte(CP_ACP, 0, buf, -1, bufA, MAX_PATH, nullptr, nullptr);
-		return SusieGetPictureInfoFromFile(bufA, len, flag, lpInfo);
-	} else {
-		return SusieGetPictureInfoFromFile(reinterpret_cast<const char*>(buf), len, flag, lpInfo);
-	}
+	try {
+		if (!buf || !lpInfo) return SUSIEERROR_INTERNAL;
+		return GetPictureInfoImpl(buf, len, flag, true, lpInfo);
+	} catch (...) { return SUSIEERROR_INTERNAL; }
 }
 
-extern "C" int __stdcall GetPicture(LPCSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS lpProgressCallback, LONG_PTR lData)
+int __stdcall GetPicture(LPCSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS progress, LONG_PTR lData)
 {
-	return SusieGetPictureFromFile(buf, len, flag, pHBInfo, pHBm, lpProgressCallback, lData);
+	try {
+		if (!buf || !pHBInfo || !pHBm) return SUSIEERROR_INTERNAL;
+		return GetPictureImpl(buf, len, flag, false, pHBInfo, pHBm, progress, lData);
+	} catch (...) { return SUSIEERROR_INTERNAL; }
 }
 
-extern "C" int __stdcall GetPictureW(LPCWSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS lpProgressCallback, LONG_PTR lData)
+int __stdcall GetPictureW(LPCWSTR buf, LONG_PTR len, unsigned int flag, HLOCAL* pHBInfo, HLOCAL* pHBm, SUSIE_PROGRESS progress, LONG_PTR lData)
 {
-	if ((flag & 0x07) == SUSIE_INPUT_DISK) {
-		char bufA[MAX_PATH];
-		WideCharToMultiByte(CP_ACP, 0, buf, -1, bufA, MAX_PATH, nullptr, nullptr);
-		return SusieGetPictureFromFile(bufA, len, flag, pHBInfo, pHBm, lpProgressCallback, lData);
-	} else {
-		return SusieGetPictureFromFile(reinterpret_cast<const char*>(buf), len, flag, pHBInfo, pHBm, lpProgressCallback, lData);
-	}
+	try {
+		if (!buf || !pHBInfo || !pHBm) return SUSIEERROR_INTERNAL;
+		return GetPictureImpl(buf, len, flag, true, pHBInfo, pHBm, progress, lData);
+	} catch (...) { return SUSIEERROR_INTERNAL; }
 }
+
+}  // extern "C"
