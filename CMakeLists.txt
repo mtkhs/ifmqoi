@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
+
 project(ifmqoi LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -12,10 +13,8 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 if(MSVC)
-    add_compile_options(/W4 /utf-8)
+    add_compile_options(/W4 /utf-8 /Zc:__cplusplus)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
-else()
-    add_compile_options(-Wall -Wextra -pedantic)
 endif()
 
 add_library(ifmqoi SHARED
@@ -27,12 +26,8 @@ set_target_properties(ifmqoi PROPERTIES
     PREFIX ""
     OUTPUT_NAME "ifmqoi"
     SUFFIX ".sph"
+    LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/ifmqoi.def"
 )
-if(MSVC)
-    set_target_properties(ifmqoi PROPERTIES
-        LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/ifmqoi.def"
-    )
-endif()
 
 option(IFMQOI_BUILD_TESTS "Build smoke tests" ON)
 if(IFMQOI_BUILD_TESTS)
